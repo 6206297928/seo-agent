@@ -1,10 +1,23 @@
+import os
+import subprocess
+import sys
+
+# --- EMERGENCY FIX: FORCE INSTALL ---
+# This checks if bs4 is missing and installs it automatically
+try:
+    import bs4
+except ImportError:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "beautifulsoup4"])
+    import bs4
+
+# --- NORMAL IMPORTS ---
 import streamlit as st
 import time
 import random
 import requests
 import io
 import pandas as pd
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup  # Now this will work!
 from urllib.parse import urljoin, urlparse
 import google.generativeai as genai
 import urllib3
