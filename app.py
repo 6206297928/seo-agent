@@ -5,7 +5,7 @@ from gemini_agent import GeminiAgent
 # ------------------------------
 # Load Dataset
 # ------------------------------
-CSV_PATH = "data/masked.csv"
+CSV_PATH = "masked_data.csv"  # <- your actual file name
 
 st.title("📊 Student Performance Analysis (with Gemini AI Summary)")
 
@@ -58,7 +58,7 @@ sleep = st.slider("Sleep Hours/Night", 0, 12, 7)
 
 department = st.selectbox("Department", ["CS", "Engineering", "Mathematics"])
 
-# One-hot
+# One-hot encoding for department
 dept_cs = 1 if department == "CS" else 0
 dept_eng = 1 if department == "Engineering" else 0
 dept_math = 1 if department == "Mathematics" else 0
