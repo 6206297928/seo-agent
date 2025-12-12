@@ -1,153 +1,214 @@
+# app.py
 import streamlit as st
 import pandas as pd
 import numpy as np
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.ensemble import RandomForestClassifier
-from gemini_agent import GeminiAgent
+from sklearn.exceptions import NotFittedError
 
+# Try to import user-provided agent wrapper; if missing we'll call Gemini directly
+try:
+    from agent import GeminiAgent  # user said they will have agent.py
+    HAVE_AGENT_WRAPPER = True
+except Exception:
+    HAVE_AGENT_WRAPPER = False
 
-# -----------------------------------------
-# STREAMLIT PAGE CONFIG
-# -----------------------------------------
+# We'll lazily import google.generativeai only when needed to avoid import errors at startup.
+# requirements.txt must include: google-generativeai (or adjust for your environment)
+
 st.set_page_config(page_title="AI Student Performance Predictor", layout="wide")
-st.title("🎓 AI-Powered Student Performance Predictor")
-st.markdown("Predict student grade + get AI-generated summary using Gemini.")
+st.title("🎓 AI Student Performance Predictor")
+st.markdown("Predict student grade and get an AI-generated summary (Gemini).")
 
+# -----------------------------
+# Constants: expected exact columns
+# -----------------------------
+EXPECTED_COLUMNS = [
+ 'Gender','Age','Attendance (%)','Midterm_Score','Final_Score','Assignments_Avg',
+ 'Quizzes_Avg','Participation_Score','Projects_Score','Total_Score','Grade',
+ 'Study_Hours_per_Week','Extracurricular_Activities','Internet_Access_at_Home',
+ 'Parent_Education_Level','Family_Income_Level','Stress_Level (1-10)',
+ 'Sleep_Hours_per_Night','Department_CS','Department_Engineering','Department_Mathematics'
+]
 
-
-# -----------------------------------------
-# LOAD DATA + TRAIN MODEL (NO PKL FILES)
-# -----------------------------------------
+# -----------------------------
+# Load dataset and train model
+# -----------------------------
 @st.cache_resource
-def load_and_train():
-    df = pd.read_csv("masked_data.csv")
+def load_and_train_model(path="masked_data.csv"):
+    # 1. Load
+    df = pd.read_csv(path)
+    # normalize column names (strip)
+    df.columns = df.columns.str.strip()
 
-    # ---- Fill Missing ----
-    df["Parent_Education_Level"] = df["Parent_Education_Level"].fillna("Bachelor's")
+    # 2. Ensure expected columns present (we won't fail; we'll adapt)
+    missing = [c for c in EXPECTED_COLUMNS if c not in df.columns]
+    if missing:
+        st.warning(f"Warning: dataset missing expected columns: {missing}. App will attempt to proceed with available columns.")
+    # 3. Basic cleaning: map common categorical variants to canonical forms
+    # Gender variants
+    if "Gender" in df.columns:
+        df["Gender"] = df["Gender"].astype(str).str.strip().replace({
+            "M": "Male", "F": "Female", "m": "Male", "f": "Female"
+        })
 
-    # ---- Encode Binary ----
-    df["Gender"] = df["Gender"].map({"Male": 0, "Female": 1})
-    df["Extracurricular_Activities"] = df["Extracurricular_Activities"].map({"No": 0, "Yes": 1})
-    df["Internet_Access_at_Home"] = df["Internet_Access_at_Home"].map({"No": 0, "Yes": 1})
+    # Extracurricular & Internet variants
+    for col in ["Extracurricular_Activities", "Internet_Access_at_Home"]:
+        if col in df.columns:
+            df[col] = df[col].astype(str).str.strip().replace({
+                "yes": "Yes", "no": "No", "Y": "Yes", "N": "No", "y": "Yes", "n": "No",
+                "TRUE": "Yes", "FALSE": "No", "true": "Yes", "false": "No"
+            })
 
-    # ---- Ordinal Encoding ----
-    edu_map = {"High School": 1, "Bachelor's": 2, "Master's": 3, "PhD": 4}
-    df["Parent_Education_Level"] = df["Parent_Education_Level"].map(edu_map)
+    # Parent education normalization (some datasets use slightly different names)
+    if "Parent_Education_Level" in df.columns:
+        df["Parent_Education_Level"] = df["Parent_Education_Level"].astype(str).str.strip().replace({
+            "Bachelors": "Bachelor's", "Bachelor": "Bachelor's", "HighSchool": "High School",
+            "High-school": "High School"
+        })
 
-    income_map = {"Low": 1, "Medium": 2, "High": 3}
-    df["Family_Income_Level"] = df["Family_Income_Level"].map(income_map)
+    # Family income normalization
+    if "Family_Income_Level" in df.columns:
+        df["Family_Income_Level"] = df["Family_Income_Level"].astype(str).str.strip().replace({
+            "low": "Low", "medium": "Medium", "high": "High"
+        })
 
-    # ---- One-hot Encoding Department ----
-    df = pd.get_dummies(df, columns=["Department"], drop_first=True)
+    # 4. Map binary columns to 0/1 where applicable
+    binary_map = {"Yes": 1, "No": 0}
+    for col in ["Extracurricular_Activities", "Internet_Access_at_Home"]:
+        if col in df.columns:
+            df[col] = df[col].map(binary_map).astype(float)
 
-    # Fill missing numeric values
+    # Gender mapping
+    if "Gender" in df.columns:
+        df["Gender"] = df["Gender"].map({"Male": 0, "Female": 1}).astype(float)
+
+    # 5. Ordinal maps
+    if "Parent_Education_Level" in df.columns:
+        edu_map = {"High School": 1, "Bachelor's": 2, "Master's": 3, "PhD": 4}
+        df["Parent_Education_Level"] = df["Parent_Education_Level"].map(edu_map).astype(float)
+
+    if "Family_Income_Level" in df.columns:
+        income_map = {"Low": 1, "Medium": 2, "High": 3}
+        df["Family_Income_Level"] = df["Family_Income_Level"].map(income_map).astype(float)
+
+    # 6. One-hot for department if original 'Department' exists; otherwise assume Department_* present
+    if "Department" in df.columns:
+        df = pd.get_dummies(df, columns=["Department"], prefix="Department", drop_first=False)
+    else:
+        # ensure Department_* columns exist so model/training has consistent columns
+        for c in ["Department_CS", "Department_Engineering", "Department_Mathematics"]:
+            if c not in df.columns:
+                df[c] = 0
+
+    # 7. Convert any remaining object columns to numeric where possible
+    for c in df.columns:
+        if df[c].dtype == "object":
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    # 8. Fill numerical NaNs with column mean
     df.fillna(df.mean(numeric_only=True), inplace=True)
 
-    # ---- Label Encode Target ----
-    encoder = LabelEncoder()
-    df["Grade"] = encoder.fit_transform(df["Grade"])
+    # 9. Ensure Grade exists
+    if "Grade" not in df.columns:
+        raise ValueError("masked_data.csv must contain a 'Grade' column.")
 
-    # ---- Feature Scaling ----
-    numeric_cols = df.select_dtypes(include=["int64", "float64"]).columns.tolist()
-    numeric_cols = [c for c in numeric_cols if c != "Grade"]
+    # 10. Label encode Grade
+    label_enc = LabelEncoder()
+    df["Grade"] = label_enc.fit_transform(df["Grade"].astype(str))
 
+    # 11. Prepare features: drop Grade, ensure numeric-only
+    X = df.drop(columns=["Grade"])
+    # Keep only numeric features for X
+    X = X.select_dtypes(include=[np.number])
+
+    # 12. Scale numeric features
     scaler = StandardScaler()
-    df[numeric_cols] = scaler.fit_transform(df[numeric_cols])
+    X_scaled = scaler.fit_transform(X)
+    X = pd.DataFrame(X_scaled, columns=X.columns)
 
-    # ---- Train Model ----
-    X = df.drop("Grade", axis=1)
-    y = df["Grade"]
-
+    # 13. Train RandomForest
     model = RandomForestClassifier(n_estimators=200, random_state=42)
-    model.fit(X, y)
+    model.fit(X, df["Grade"])
 
-    return model, scaler, encoder, X.columns, df
+    # Return trained components and reference df (original processed df before scaling)
+    return model, scaler, label_enc, X.columns.tolist(), df
 
-
-model, scaler, encoder, model_columns, df_ref = load_and_train()
-
-
-
-# -----------------------------------------
-# GEMINI API KEY INPUT
-# -----------------------------------------
-st.sidebar.subheader("🔑 Enter Gemini API Key")
-api_key = st.sidebar.text_input("Gemini API Key", type="password")
-agent = None
-
-if api_key:
-    agent = GeminiAgent(api_key)
-else:
-    st.warning("Please enter your Gemini API key to enable AI summary.")
+# Train on startup (cached)
+try:
+    model, scaler, label_encoder, model_columns, df_ref = load_and_train_model("masked_data.csv")
+except Exception as e:
+    st.error(f"Failed to load/train model: {e}")
+    st.stop()
 
 
+st.success("Model trained in-memory (ready).")
 
-# -----------------------------------------
-# USER INPUT SECTION
-# -----------------------------------------
-st.sidebar.header("Student Parameters")
+# -----------------------------
+# Helper: build user-facing UI and auto-compute missing fields
+# -----------------------------
+st.sidebar.header("Student Parameters (fill the form)")
 
-def user_input():
-    gender = st.sidebar.selectbox("Gender", ("Male", "Female"))
-    dept = st.sidebar.selectbox("Department", ("CS", "Engineering", "Mathematics"))
-    parent_edu = st.sidebar.selectbox("Parent Education", ("High School", "Bachelor's", "Master's", "PhD"))
-    income = st.sidebar.selectbox("Family Income", ("Low", "Medium", "High"))
-    extra = st.sidebar.selectbox("Extracurricular Activities", ("Yes", "No"))
-    internet = st.sidebar.selectbox("Internet Access at Home", ("Yes", "No"))
-
+def get_user_input_auto():
+    # Human-friendly fields only
+    gender = st.sidebar.selectbox("Gender", ["Male", "Female"])
+    dept = st.sidebar.selectbox("Department", ["CS", "Engineering", "Mathematics"])
     attendance = st.sidebar.slider("Attendance (%)", 0, 100, 80)
     study_hours = st.sidebar.number_input("Study Hours per Week", 0, 80, 15)
-    sleep = st.sidebar.number_input("Sleep Hours per Night", 1, 12, 7)
     stress = st.sidebar.slider("Stress Level (1-10)", 1, 10, 5)
+    sleep = st.sidebar.number_input("Sleep Hours per Night", 0, 12, 7)
 
+    st.sidebar.subheader("Exam Scores")
     midterm = st.sidebar.number_input("Midterm Score", 0, 100, 70)
     final = st.sidebar.number_input("Final Score", 0, 100, 75)
     assignments = st.sidebar.number_input("Assignments Avg", 0, 100, 80)
     projects = st.sidebar.number_input("Projects Score", 0, 100, 85)
 
-    # ---- Auto-computed fields ----
-    quizzes = df_ref["Quizzes_Avg"].mean()
-    participation = df_ref["Participation_Score"].mean()
-    age = df_ref["Age"].mean()
+    extracurricular = st.sidebar.selectbox("Extracurricular Activities", ["Yes", "No"])
+    internet = st.sidebar.selectbox("Internet Access at Home", ["Yes", "No"])
+    parent_edu = st.sidebar.selectbox("Parent Education Level", ["High School", "Bachelor's", "Master's", "PhD"])
+    income = st.sidebar.selectbox("Family Income Level", ["Low", "Medium", "High"])
+
+    # Auto-compute fields from df_ref means
+    quizzes = df_ref["Quizzes_Avg"].mean() if "Quizzes_Avg" in df_ref.columns else 70.0
+    participation = df_ref["Participation_Score"].mean() if "Participation_Score" in df_ref.columns else 75.0
+    age = df_ref["Age"].mean() if "Age" in df_ref.columns else 20.0
 
     total = midterm + final + assignments + projects + quizzes + participation
 
-    d = {
+    user = {
         "Gender": gender,
-        "Age": age,
-        "Attendance (%)": attendance,
-        "Midterm_Score": midterm,
-        "Final_Score": final,
-        "Assignments_Avg": assignments,
-        "Quizzes_Avg": quizzes,
-        "Participation_Score": participation,
-        "Projects_Score": projects,
-        "Total_Score": total,
-        "Study_Hours_per_Week": study_hours,
-        "Extracurricular_Activities": extra,
+        "Age": float(age),
+        "Attendance (%)": float(attendance),
+        "Midterm_Score": float(midterm),
+        "Final_Score": float(final),
+        "Assignments_Avg": float(assignments),
+        "Quizzes_Avg": float(quizzes),
+        "Participation_Score": float(participation),
+        "Projects_Score": float(projects),
+        "Total_Score": float(total),
+        "Study_Hours_per_Week": float(study_hours),
+        "Extracurricular_Activities": extracurricular,
         "Internet_Access_at_Home": internet,
         "Parent_Education_Level": parent_edu,
         "Family_Income_Level": income,
-        "Stress_Level (1-10)": stress,
-        "Sleep_Hours_per_Night": sleep,
+        "Stress_Level (1-10)": float(stress),
+        "Sleep_Hours_per_Night": float(sleep),
         "Department": dept
     }
+    return pd.DataFrame([user])
 
-    return pd.DataFrame([d])
+input_df_raw = get_user_input_auto()
+st.subheader("Input preview (human-friendly)")
+st.dataframe(input_df_raw, use_container_width=True)
 
+# -----------------------------
+# Preprocess user input to match training features
+# -----------------------------
+def preprocess_input(raw_df):
+    df = raw_df.copy()
 
-input_df = user_input()
-st.subheader("📌 Input Preview")
-st.dataframe(input_df, use_container_width=True)
-
-
-
-# -----------------------------------------
-# PREPROCESS INPUT BEFORE PREDICTION
-# -----------------------------------------
-def preprocess_input(df):
-    df = df.copy()
-
+    # map binary and ordinals (same mappings used in training)
     df["Gender"] = df["Gender"].map({"Male": 0, "Female": 1})
     df["Extracurricular_Activities"] = df["Extracurricular_Activities"].map({"No": 0, "Yes": 1})
     df["Internet_Access_at_Home"] = df["Internet_Access_at_Home"].map({"No": 0, "Yes": 1})
@@ -158,30 +219,105 @@ def preprocess_input(df):
     income_map = {"Low": 1, "Medium": 2, "High": 3}
     df["Family_Income_Level"] = df["Family_Income_Level"].map(income_map)
 
-    df = pd.get_dummies(df, columns=["Department"], drop_first=True)
+    # One-hot department -> Department_CS, Department_Engineering, Department_Mathematics
+    df["Department_CS"] = 0
+    df["Department_Engineering"] = 0
+    df["Department_Mathematics"] = 0
+    chosen = df.loc[0, "Department"]
+    if chosen == "CS":
+        df.loc[0, "Department_CS"] = 1
+    elif chosen == "Engineering":
+        df.loc[0, "Department_Engineering"] = 1
+    elif chosen == "Mathematics":
+        df.loc[0, "Department_Mathematics"] = 1
 
-    # Align columns with model
-    df = df.reindex(columns=model_columns, fill_value=0)
+    # drop the Department column
+    df = df.drop(columns=["Department"])
 
-    # Scale numeric features
-    num_cols = df.select_dtypes(include=["float64", "int64"]).columns
-    df[num_cols] = scaler.transform(df[num_cols])
+    # Keep only columns that model_columns contains; create missing ones with 0
+    for col in model_columns:
+        if col not in df.columns:
+            df[col] = 0
 
-    return df
+    df = df[model_columns]  # order columns same as training
 
+    # Ensure numeric dtype
+    df = df.apply(pd.to_numeric, errors="coerce")
+    df.fillna(0, inplace=True)
 
+    # Scale numeric columns using the scaler fitted on training data
+    # scaler expects the same numeric columns used earlier - we trained scaler on all numeric X columns
+    try:
+        scaled = scaler.transform(df)
+        df_scaled = pd.DataFrame(scaled, columns=df.columns)
+    except Exception as e:
+        # Fallback: if transform fails, try to coerce and proceed without scaling
+        st.warning(f"Scaling failed for input: {e}. Proceeding without scaling.")
+        df_scaled = df
 
-# -----------------------------------------
-# PREDICTION BUTTON
-# -----------------------------------------
-if st.button("🔮 Predict Grade"):
-    processed = preprocess_input(input_df)
-    pred_encoded = model.predict(processed)[0]
-    pred_label = encoder.inverse_transform([pred_encoded])[0]
+    return df_scaled
 
-    st.success(f"### 🎯 Predicted Grade: **{pred_label}**")
+# -----------------------------
+# Predict + Gemini summary
+# -----------------------------
+if st.button("Predict Grade & Generate Summary"):
+    processed = preprocess_input(input_df_raw)
 
-    if agent:
-        st.subheader("🧠 AI-Generated Performance Summary")
-        summary = agent.get_summary(input_df, pred_label)
-        st.write(summary)
+    # Predict
+    try:
+        pred_encoded = model.predict(processed)[0]
+    except Exception as e:
+        st.error(f"Prediction failed: {e}")
+        raise
+
+    pred_label = label_encoder.inverse_transform([pred_encoded])[0]
+    st.success(f"🎯 Predicted Grade: **{pred_label}**")
+
+    # Prepare readable input for summary
+    readable = input_df_raw.to_dict(orient="records")[0]
+    # make sure readable values are simple types
+    for k, v in readable.items():
+        if isinstance(v, (np.generic, np.ndarray)):
+            readable[k] = v.item() if hasattr(v, "item") else v
+
+    # Gemini summary (requires API key)
+    api_key = st.sidebar.text_input("Gemini API Key (for AI summary)", type="password")
+    if not api_key:
+        st.info("Enter Gemini API key in the sidebar to generate the AI summary.")
+    else:
+        # Use user-supplied agent wrapper if available
+        if HAVE_AGENT_WRAPPER:
+            try:
+                agent = GeminiAgent(api_key)
+                summary = agent.get_summary(readable, pred_label)  # wrapper should implement get_summary
+                st.subheader("🧠 AI Summary (via agent.py)")
+                st.write(summary)
+            except Exception as e:
+                st.warning(f"Agent wrapper failed: {e}. Falling back to direct Gemini call.")
+                HAVE_AGENT_WRAPPER_FALLBACK = True
+        else:
+            HAVE_AGENT_WRAPPER_FALLBACK = True
+
+        # fallback: direct call to google.generativeai
+        if 'HAVE_AGENT_WRAPPER_FALLBACK' in locals() and HAVE_AGENT_WRAPPER_FALLBACK:
+            try:
+                import google.generativeai as genai
+                genai.configure(api_key=api_key)
+
+                prompt = f"""
+You are an educational advisor. Here is a student's profile and prediction.
+Student profile:
+{readable}
+
+Predicted Grade: {pred_label}
+
+Provide a short summary (3-6 bullet points): strengths, weaknesses, and 4 actionable recommendations for the student.
+"""
+                res = genai.generate_text(model="gemini-2.0-flash-lite-preview-02-05", prompt=prompt)
+                summary_text = getattr(res, "text", None) or str(res)
+                st.subheader("🧠 AI Summary (Gemini)")
+                st.write(summary_text)
+            except Exception as e:
+                st.error(f"Failed to call Gemini directly: {e}")
+                st.write("If you want AI summaries, ensure 'google-generativeai' is installed and the API key is valid.")
+
