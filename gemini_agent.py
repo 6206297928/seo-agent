@@ -4,7 +4,7 @@ class GeminiAgent:
     def __init__(self, api_key: str):
         genai.configure(api_key=api_key)
         # Use Gemini 2.5
-        self.model = genai.GenerativeModel("gemini-2.5")
+        self.model = genai.GenerativeModel("gemini-2.5-flash")
 
     def summarize(self, text: str) -> str:
         try:
